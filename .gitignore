@@ -1,0 +1,7 @@
+*.env
+.env
+.env.*
+settings.json
+cloud_state.json
+__pycache__/
+*.pyc

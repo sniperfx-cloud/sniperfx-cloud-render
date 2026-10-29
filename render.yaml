@@ -1,0 +1,22 @@
+# SniperFx Cloud v2 — Render Background Worker (paid; no web service/port needed)
+# GitHub upload: all files in repository ROOT, including this render.yaml
+services:
+  - type: worker
+    name: sniperfx-cloud
+    runtime: docker
+    plan: 0.5c-512mb
+    region: singapore
+    numInstances: 1
+    disk:
+      name: sniperfx-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: SNIPERFX_DATA_DIR
+        value: /data
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TWELVE_DATA_API_KEY
+        sync: false
+      - key: PAIRING_PIN
+        sync: false
