@@ -24,11 +24,15 @@ APP_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_FILE = APP_DIR / 'settings.json'
 UTC = dt.timezone.utc
 LOCK = threading.RLock()
-SYMBOLS = {'XAUUSD': 'XAU/USD', 'BTCUSD': 'BTC/USD', 'EURUSD': 'EUR/USD'}
+SYMBOLS = {'XAUUSD': 'XAU/USD', 'BTCUSD': 'BTC/USD', 'EURUSD': 'EUR/USD',
+           'USDJPY': 'USD/JPY', 'AUDUSD': 'AUD/USD'}
 DEFAULT_COSTS = {
     'XAUUSD': {'spread': 0.50, 'slippage': 0.30, 'raw_commission': 7.0},
     'BTCUSD': {'spread': 25.0, 'slippage': 15.0, 'raw_commission': 4.0},
     'EURUSD': {'spread': 0.00015, 'slippage': 0.00008, 'raw_commission': 7.0},
+    # Assumed reserve, NOT broker live spread or actual commission. Verify Exness specs.
+    'USDJPY': {'spread': 0.020, 'slippage': 0.010, 'raw_commission': 7.0},
+    'AUDUSD': {'spread': 0.00015, 'slippage': 0.00008, 'raw_commission': 7.0},
 }
 DEFAULTS = dict(api_key='', telegram_token='', owner_chat_id=None,
                 pairing_pin='', capital_usd=100.0, account='cent', risk_pct=0.5,
@@ -39,7 +43,7 @@ DEFAULTS = dict(api_key='', telegram_token='', owner_chat_id=None,
                 max_total_drawdown_pct=10.0, costs=DEFAULT_COSTS,
                 last_alert_id={}, last_error='')
 CACHE = {}
-STATUS = {'last_scan_utc': '-', 'scan_result': 'Not running yet', 'data_errors': [], 'alerts_sent': 0, 'telegram_poll': 'Waiting for Telegram token', 'telegram_last_ok': '-', 'telegram_error': ''}
+STATUS = {'last_scan_utc': '-', 'scan_result': 'Not running yet', 'data_errors': [], 'alerts_sent': 0, 'per_symbol': {}, 'cycle_errors': 0, 'telegram_poll': 'Waiting for Telegram token', 'telegram_last_ok': '-', 'telegram_error': ''}
 API_RATE_LOCK = threading.Lock()
 LAST_API_CALL = [0.0]
 
@@ -166,11 +170,29 @@ def fetch_candles(symbol, interval, now=None):
         delay = 9.0 - (time.monotonic() - LAST_API_CALL[0])
         if delay > 0: time.sleep(delay)
         LAST_API_CALL[0] = time.monotonic()
-    result = http_json('https://api.twelvedata.com/time_series', {
+    request_args = {
         'symbol': SYMBOLS[symbol], 'interval': interval,
         'outputsize': 235 if interval in ('1h','4h') else 125,
-        'timezone': 'UTC', 'apikey': key
-    })
+        'timezone': 'UTC', 'apikey': key}
+    # Retry transient failures with pacing; never log API keys.
+    for attempt in range(3):
+        try:
+            if attempt:
+                with API_RATE_LOCK:
+                    delay = 9.0 - (time.monotonic() - LAST_API_CALL[0])
+                    if delay > 0: time.sleep(delay)
+                    LAST_API_CALL[0] = time.monotonic()
+            result = http_json('https://api.twelvedata.com/time_series', request_args, timeout=12)
+            if result.get('status') == 'error':
+                code = result.get('code')
+                if code in (429, 500, 502, 503, 504) and attempt<2:
+                    time.sleep(3*(attempt+1))
+                    continue
+            break
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+            if attempt == 2:
+                raise RuntimeError(f'{symbol} {interval}: {type(exc).__name__} after 3 tries') from None
+            time.sleep(3*(attempt+1))
     if result.get('status') == 'error' or 'values' not in result:
         raise RuntimeError(str(result.get('message', 'No candles returned'))[:180])
     period_sec = {'15min': 900, '1h':3600, '4h':14400}[interval]
@@ -246,15 +268,19 @@ def calc_lot(symbol, entry, sl, equity, account, risk_pct, cost_config):
         return {'ok':False,'reason':'Invalid entry, stop, balance or risk'}
     if symbol not in SYMBOLS or account not in ('cent','raw') or not (0<risk_pct<=1):
         return {'ok':False,'reason':'Unsupported account or risk >1%'}
-    # standard: EURUSD 100000 EUR, gold 100oz, BTC 1 BTC.
+    # standard: FX 100,000 base units, gold 100oz, BTC 1 BTC.
     # cent: 1 cent lot = 0.01 standard lot. NOT same lot units as Raw.
-    standard = {'EURUSD':100000, 'XAUUSD':100, 'BTCUSD':1}[symbol]
+    standard = {'EURUSD':100000, 'XAUUSD':100, 'BTCUSD':1,
+                'USDJPY':100000, 'AUDUSD':100000}[symbol]
     contract = standard * (0.01 if account == 'cent' else 1)
     cost = cost_config[symbol]
     extra_move = float(cost['spread']) + float(cost['slippage'])
     commission = float(cost['raw_commission']) * (0.01 if account == 'cent' else 1) if account=='raw' else 0
     # commission is round-trip USD per unit of displayed account lot
-    per_lot_risk = (abs(entry-sl)+extra_move)*contract+commission
+    # USDJPY P/L is JPY, not USD. Convert conservatively at the lower
+    # of entry and SL; all other supported symbols quote in USD.
+    quote_to_usd = 1.0 / min(entry, sl) if symbol == 'USDJPY' else 1.0
+    per_lot_risk = (abs(entry-sl)+extra_move)*contract*quote_to_usd+commission
     cap_risk = equity*risk_pct/100
     if not math.isfinite(per_lot_risk) or per_lot_risk <=0 or extra_move<0 or commission<0:
         return {'ok':False,'reason':'Invalid cost assumptions'}
@@ -266,7 +292,7 @@ def calc_lot(symbol, entry, sl, equity, account, risk_pct, cost_config):
     estimated_loss = lots*per_lot_risk
     def target(r):
         # include estimated execution costs in TP required to reach approximate net R.
-        dist = (r*per_lot_risk + extra_move*contract+commission)/contract
+        dist = (r*per_lot_risk + extra_move*contract*quote_to_usd+commission)/(contract*quote_to_usd)
         return entry+dist if entry>sl else entry-dist
     return {'ok': True, 'lots':round(lots,2), 'risk':round(estimated_loss,4),
             'budget':round(cap_risk,4),'risk_pct_actual':round(100*estimated_loss/equity,4),
@@ -308,7 +334,7 @@ def risk_lock_reason():
 
 
 def format_number(v, symbol):
-    return f'{v:.5f}' if symbol=='EURUSD' else (f'{v:.2f}' if symbol=='XAUUSD' else f'{v:.1f}')
+    return f'{v:.5f}' if symbol in ('EURUSD','AUDUSD') else (f'{v:.3f}' if symbol=='USDJPY' else (f'{v:.2f}' if symbol=='XAUUSD' else f'{v:.1f}'))
 
 
 def make_alert(s, p):
@@ -332,6 +358,12 @@ def make_alert(s, p):
             f'Entry price বদলালে পুরোনো lot ব্যবহার নয়। SL-এ slippage হতে পারে; অন্ধভাবে কপি করবেন না।')
 
 
+def emit_alert(ident, symbol, bar_time, msg):
+    # The local legacy runner sends directly; the cloud runner replaces this
+    # hook with a durable pending-signal queue. Trading logic is unchanged.
+    return tg_send(msg)
+
+
 def scan_cycle(force=False):
     now=dt.datetime.now(UTC)
     with LOCK:
@@ -346,8 +378,11 @@ def scan_cycle(force=False):
         STATUS['scan_result']='Risk lock: '+lock; return
     alerts=0
     errors=[]
+    per_symbol = {}
     for symbol in SYMBOLS:
-        if not is_market_hours(symbol,now): continue
+        if not is_market_hours(symbol,now):
+            per_symbol[symbol] = {'state':'market closed', 'bar':'-', 'error':''}
+            continue
         bars={}
         for interval, ttl in [('15min',900),('1h',3600),('4h',14400)]:
             key=(symbol,interval)
@@ -364,7 +399,11 @@ def scan_cycle(force=False):
             except Exception as exc:
                 errors.append(f'{symbol} {interval}: {str(exc)[:100]}')
                 # Never use stale data to issue new alerts.
-        if len(bars)!=3: continue
+        if len(bars)!=3:
+            per_symbol[symbol] = {'state':'data unavailable', 'bar':'-',
+                                  'error':'; '.join(e for e in errors if e.startswith(symbol+' '))[-170:]}
+            continue
+        per_symbol[symbol] = {'state':'evaluated', 'bar':bars['15min'][-1]['t'], 'error':''}
         try:
             s=signal_strategy(symbol,bars['15min'],bars['1h'],bars['4h'])
             if not s: continue
@@ -376,17 +415,22 @@ def scan_cycle(force=False):
                     STATUS['scan_result']=f'{symbol} pattern found but risk gate says NO TRADE: '+p['reason']
                     continue
                 msg=make_alert(s,p)
-            if tg_send(msg):
+            if emit_alert(ident, symbol, s['bar_time'], msg):
                 alerts+=1
                 with LOCK:
                     CFG['last_alert_id'][symbol]=ident
                     save_config()
         except Exception as exc:
             errors.append(f'{symbol}: {str(exc)[:120]}')
+            per_symbol[symbol]['state']='evaluation error'
+            per_symbol[symbol]['error']=str(exc)[:120]
     STATUS.update(last_scan_utc=now.isoformat(timespec='minutes'),
-                  scan_result=f'Checked 3 symbols; {alerts} new qualifying alert(s)',
-                  data_errors=errors[-8:],alerts_sent=STATUS['alerts_sent']+alerts)
-    if errors: print('Data warnings:', '; '.join(errors[:3]))
+                  scan_result=f'Evaluated {sum(v["state"]=="evaluated" for v in per_symbol.values())}/{len(SYMBOLS)} active symbol(s); {alerts} new candidate(s) queued',
+                  per_symbol=per_symbol, cycle_errors=len(errors),
+                  data_errors=errors[-8:])
+    if errors: print('Data warnings:', '; '.join(errors[:3]), flush=True)
+    return {'evaluated': sum(v['state']=='evaluated' for v in per_symbol.values()),
+            'errors': errors, 'candidates': alerts, 'per_symbol': per_symbol}
 
 
 def scan_loop():
@@ -444,7 +488,7 @@ def handle_command(textmsg, chat_id):
             telegram_reply(chat_id, '⚠️ শুধু PIN বা start PIN লিখলে হবে না। একই মেসেজে স্ল্যাশসহ পাঠান: /start 123456\nসঠিক PIN দেখুন কম্পিউটারের setup page-এ।')
         return
     if cmd=='/help': return tg_send(HELP)
-    if cmd=='/symbols':return tg_send('XAUUSD (gold), BTCUSD (Bitcoin), EURUSD (euro-dollar).\nBroker: Exness MT5; data: Twelve Data external candle feed.')
+    if cmd=='/symbols':return tg_send('XAUUSD (gold), BTCUSD (Bitcoin), EURUSD, USDJPY, AUDUSD.\nBroker: Exness MT5; data: Twelve Data external candle feed.')
     if cmd=='/status':
         with LOCK:
             eq=CFG['capital_usd']; acc=CFG['account']; pct=CFG['risk_pct']

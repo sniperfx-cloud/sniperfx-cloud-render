@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SniperFx v2 cloud worker (no website, no MT5 order execution).
+"""SniperFx v2.1 cloud worker (no website, no MT5 order execution).
 Built atop the user's previous experimental v1.1 signal/lot engine.
 Require mounted persistent volume at /data on Render/Railway. No secret is baked into source.
 """
@@ -11,6 +11,8 @@ import secrets
 import sys
 import threading
 import time
+import socket
+import urllib.error
 from pathlib import Path
 
 # Render Blueprint explicitly sets SNIPERFX_DATA_DIR=/data. Railway may also use this script.
@@ -26,8 +28,19 @@ if not DEV_MODE and not os.path.ismount(DATA_DIR):
     print('SETUP ERROR: /data is not a mounted persistent disk; refusing ephemeral state.', flush=True)
     sys.exit(2)
 os.environ['APPDATA'] = DATA_DIR  # Earlier engine stores settings at APPDATA/SniperIntelligence
+# Never reset equity, pairing or 5+ signal history from a corrupt state file.
+settings_file = Path(DATA_DIR) / 'SniperIntelligence' / 'settings.json'
+if settings_file.exists():
+    try:
+        saved_settings = json.loads(settings_file.read_text(encoding='utf-8'))
+        if not isinstance(saved_settings, dict):
+            raise ValueError('invalid settings type')
+    except (OSError, ValueError, TypeError):
+        print('SETUP ERROR: Existing settings file is corrupt. STOPPED to protect capital/pairing.', flush=True)
+        sys.exit(2)
 
 import strategy_engine as core
+from reliability import Outbox
 
 STATE_FILE = core.APP_DIR / 'cloud_state.json'
 STATE_DEFAULTS = {
@@ -54,6 +67,53 @@ def cloud_state_load():
 
 
 STATE = cloud_state_load()
+
+# Durable outbox keeps signal candidates on the mounted /data disk across restarts.
+# No Telegram credentials or API keys are saved in these alert records.
+
+def _send_alert_telegram(message):
+    with core.LOCK:
+        chat = core.CFG.get('owner_chat_id')
+    if not chat:
+        return False, 'Telegram pairing missing', 60
+    try:
+        response = core.telegram_call('sendMessage', {'chat_id': chat, 'text': message[:3900]}, timeout=17)
+        if response.get('ok'):
+            return True, '', 0
+        return False, 'Telegram rejected send: '+str(response.get('error_code', 'unknown')), (response.get('parameters') or {}).get('retry_after', 0)
+    except urllib.error.HTTPError as ex:
+        retry = 0
+        if ex.code == 429:
+            try:
+                payload = json.loads(ex.read().decode('utf-8'))
+                retry = (payload.get('parameters') or {}).get('retry_after', 0)
+            except (OSError, ValueError, AttributeError): pass
+        return False, 'Telegram HTTP '+str(ex.code), retry
+    except (urllib.error.URLError, TimeoutError, socket.timeout) as ex:
+        return False, type(ex).__name__, 0
+    except Exception as ex:
+        return False, type(ex).__name__, 0
+
+OUTBOX = Outbox(core.APP_DIR / 'pending_signals.json', _send_alert_telegram)
+
+def _queue_signal(ident, symbol, bar_time, message):
+    return OUTBOX.enqueue(ident, symbol, bar_time, message)
+
+core.emit_alert = _queue_signal
+
+def signal_sender():
+    while True:
+        try:
+            # Fail closed: no pending BUY/SELL may arrive after /pause or risk lock.
+            with core.LOCK:
+                enabled = STATE['active']
+            if not enabled or onboarding_status() or core.risk_lock_reason():
+                OUTBOX.cancel_pending('alerts paused / setup missing / risk lock')
+            else:
+                OUTBOX.process_one()
+        except Exception as ex:
+            print('Alert queue issue:', type(ex).__name__, flush=True)
+        time.sleep(3)
 
 
 def state_save():
@@ -108,17 +168,22 @@ def status_text():
     steps=onboarding_status()
     errors=core.STATUS['data_errors']
     warnings='; '.join(errors[:2]) if errors else 'none'
-    return (f'☁️ SNIPERFX CLOUD v2\n'
+    queue=OUTBOX.totals()
+    per=core.STATUS.get('per_symbol') or {}
+    details='; '.join(f'{name}:{info["state"]}' for name,info in per.items()) or 'not scanned yet'
+    return (f'☁️ SNIPERFX CLOUD v2.1 • 5 PAIRS\n'
             f'Cloud: RUNNING | Alerts: {"ON" if active and not steps and not lock else "PAUSED"}\n'
             f'Equity: ${equity:.2f} | Account: {account.upper()} | Risk: {risk}%\n'
             f'Risk lock: {lock or "none"}\n'
             f'Last scan UTC: {core.STATUS["last_scan_utc"]}\n'
             f'Scanner: {core.STATUS["scan_result"]}\n'
             f'Data warnings: {warnings}\n'
+            f'Pairs: {details}\n'
+            f'Outbox: pending {queue["pending"]}, delivered {queue["delivered"]}, expired {queue["expired"]}, failed {queue["failed"]}, cancelled {queue["cancelled"]}\n'
             f'Setup left: {", ".join(steps) if steps else "none"}')
 
 
-CLOUD_HELP = ('☁️ SNIPERFX CLOUD v2 — পরীক্ষামূলক সিগন্যাল (DEMO)\n'
+CLOUD_HELP = ('☁️ SNIPERFX CLOUD v2.1 — 5 PAIRS (DEMO)\n'
               '/status — Cloud + market scan status\n'
               '/capital 1000 — বর্তমান USD equity সেট করুন\n'
               '/account raw  অথবা /account cent\n'
@@ -127,7 +192,8 @@ CLOUD_HELP = ('☁️ SNIPERFX CLOUD v2 — পরীক্ষামূলক �
               '/pause — alert বন্ধ করুন\n'
               '/pnl -5 — বন্ধ ট্রেডের NET USD লাভ/ক্ষতি যোগ করুন\n'
               '/plan EURUSD 1.15000 1.14800 — শুধু lot/SL/TP হিসাব\n'
-              '/symbols /help — তথ্য\n'
+              '/symbols /help — ৫টি Market ও তথ্য\n'
+              '/diag — প্রতি symbol-এর শেষ পরীক্ষা ও queue\n'
               '⚠️ MT5 auto trade নয়; Exness live quotes আলাদা হতে পারে।')
 
 
@@ -147,6 +213,16 @@ def command(textmsg, chat_id):
             return
     if cmd in ('/status', '/health'):
         return core.tg_send(status_text())
+    if cmd in ('/diag', '/diagnostics'):
+        lines=['🔎 SniperFx per-symbol diagnostics (UTC)']
+        for sym in core.SYMBOLS:
+            info=(core.STATUS.get('per_symbol') or {}).get(sym, {})
+            lines.append(f'{sym}: {info.get("state","not scanned yet")} | last closed 15M bar: {info.get("bar","-")}')
+            if info.get('error'):
+                lines.append('  ⚠ '+info['error'][:125])
+        lines.append('Durable alert queue: '+str(OUTBOX.totals()))
+        lines.append('⚠️ Data API and broker fills are not guaranteed identical.')
+        return core.tg_send('\n'.join(lines))
     if cmd == '/help':
         return core.tg_send(CLOUD_HELP)
     if cmd == '/activate':
@@ -162,7 +238,8 @@ def command(textmsg, chat_id):
         with core.LOCK:
             STATE['active']=False
             state_save()
-        return core.tg_send('⏸️ Alerts PAUSED. আবার চালু করতে /activate পাঠান।')
+        OUTBOX.cancel_pending('/pause')
+        return core.tg_send('⏸️ Alerts PAUSED. Pending candidates cancelled. আবার চালু করতে /activate পাঠান।')
     if cmd == '/capital' and len(parts)==2:
         try:
             equity=float(parts[1]); assert math.isfinite(equity) and 1<=equity<=1e8
@@ -228,37 +305,57 @@ def telegram_poll():
         except Exception as exc:
             consecutive_errors+=1
             core.STATUS['telegram_error']=str(exc)[:130]
-            print('Telegram polling issue:',type(exc).__name__,str(exc)[:100],flush=True)
-            time.sleep(min(60,3*consecutive_errors))
+            code = f'HTTP {exc.code}' if isinstance(exc, urllib.error.HTTPError) else type(exc).__name__
+            print('Telegram polling issue:', code,flush=True)
+            # Back off on Telegram 429/502 and disconnects; retry automatically.
+            time.sleep(min(90, 5*consecutive_errors))
 
 
 def scanner():
-    last_slot=None
+    """Run on closed 15m checkpoints. Retry failed data cycles inside the slot."""
+    last_complete_slot = None
+    current_slot = None
+    attempts = 0
+    next_try = 0.0
     while True:
         now=dt.datetime.now(dt.timezone.utc)
         slot=int((now.timestamp()-95)//900)
-        if last_slot!=slot:
-            last_slot=slot
+        if slot != current_slot:
+            current_slot=slot
+            attempts=0
+            next_try=0
+        if slot != last_complete_slot and attempts < 3 and time.monotonic() >= next_try:
             with core.LOCK:
                 active=STATE['active']
             if active and not onboarding_status():
                 try:
-                    core.scan_cycle()
+                    result=core.scan_cycle()
+                    attempts += 1
+                    if result and result['errors']:
+                        # Missing candles can be retried while the same closed bar
+                        # is still relevant; no rule/indicator thresholds change.
+                        next_try=time.monotonic()+65
+                    else:
+                        last_complete_slot=slot
                 except Exception as exc:
-                    core.STATUS['scan_result']='Scanner error'
-                    core.STATUS['data_errors']=[str(exc)[:120]]
-                    print('Scanner failed:', type(exc).__name__, str(exc)[:100],flush=True)
+                    attempts += 1
+                    next_try=time.monotonic()+65
+                    core.STATUS['scan_result']='Scanner error; retry scheduled'
+                    core.STATUS['data_errors']=[type(exc).__name__]
+                    print('Scanner failed:', type(exc).__name__, flush=True)
             else:
                 core.STATUS['scan_result']='Paused / waiting for /activate'
-        time.sleep(8)
+                last_complete_slot=slot
+        time.sleep(5)
 
 
 def main():
     bootstrap()
-    print('SNIPERFX CLOUD v2: ready; no public dashboard, secrets never printed.',flush=True)
+    print('SNIPERFX CLOUD v2.1: ready; no public dashboard, secrets never printed.',flush=True)
     print('Cloud persistent disk: detected. Telegram requires /start <new PIN> on first install.',flush=True)
     threading.Thread(target=telegram_poll,daemon=True).start()
     threading.Thread(target=scanner,daemon=True).start()
+    threading.Thread(target=signal_sender,daemon=True).start()
     while True: time.sleep(30)
 
 
