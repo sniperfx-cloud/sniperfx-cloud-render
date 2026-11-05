@@ -8,6 +8,7 @@ import json
 import math
 import os
 import secrets
+import random
 import sys
 import threading
 import time
@@ -160,6 +161,31 @@ def onboarding_status():
         return steps
 
 
+def telegram_poll_health(now=None):
+    """Operational diagnostics only. Does not affect signal or trade rules.
+
+    A successful getUpdates long poll confirms the inbound Telegram API was
+    reachable at that time, NOT that all future signals will be delivered.
+    """
+    now = now or dt.datetime.now(dt.timezone.utc)
+    last_ok = core.STATUS.get('telegram_last_ok', '-')
+    consecutive = int(core.STATUS.get('telegram_consecutive_errors', 0))
+    if last_ok in ('-', '', None):
+        return f'WAITING (consecutive failures {consecutive})'
+    try:
+        last = dt.datetime.fromisoformat(last_ok)
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=dt.timezone.utc)
+        elapsed = max(0, (now-last).total_seconds())
+    except (ValueError, TypeError):
+        return 'UNKNOWN (last-success timestamp unavailable)'
+    if consecutive:
+        return f'RECONNECTING (last OK {int(elapsed)}s ago; failures {consecutive})'
+    if elapsed <= 120:
+        return f'OK (last successful poll {int(elapsed)}s ago)'
+    return f'CHECK (last successful poll {int(elapsed)}s ago)'
+
+
 def status_text():
     with core.LOCK:
         equity=core.CFG['capital_usd']; account=core.CFG['account']; risk=core.CFG['risk_pct']
@@ -171,8 +197,9 @@ def status_text():
     queue=OUTBOX.totals()
     per=core.STATUS.get('per_symbol') or {}
     details='; '.join(f'{name}:{info["state"]}' for name,info in per.items()) or 'not scanned yet'
-    return (f'☁️ SNIPERFX CLOUD v2.1 • 5 PAIRS\n'
+    return (f'☁️ SNIPERFX CLOUD v2.1.1 • 5 PAIRS\n'
             f'Cloud: RUNNING | Alerts: {"ON" if active and not steps and not lock else "PAUSED"}\n'
+            f'Telegram inbound: {telegram_poll_health()}\n'
             f'Equity: ${equity:.2f} | Account: {account.upper()} | Risk: {risk}%\n'
             f'Risk lock: {lock or "none"}\n'
             f'Last scan UTC: {core.STATUS["last_scan_utc"]}\n'
@@ -183,7 +210,7 @@ def status_text():
             f'Setup left: {", ".join(steps) if steps else "none"}')
 
 
-CLOUD_HELP = ('☁️ SNIPERFX CLOUD v2.1 — 5 PAIRS (DEMO)\n'
+CLOUD_HELP = ('☁️ SNIPERFX CLOUD v2.1.1 — 5 PAIRS (DEMO)\n'
               '/status — Cloud + market scan status\n'
               '/capital 1000 — বর্তমান USD equity সেট করুন\n'
               '/account raw  অথবা /account cent\n'
@@ -220,6 +247,10 @@ def command(textmsg, chat_id):
             lines.append(f'{sym}: {info.get("state","not scanned yet")} | last closed 15M bar: {info.get("bar","-")}')
             if info.get('error'):
                 lines.append('  ⚠ '+info['error'][:125])
+        lines.append('Telegram incoming polling: '+telegram_poll_health())
+        lines.append('Telegram polling failures (runtime): '+str(core.STATUS.get('telegram_error_total', 0)))
+        lines.append('Telegram last error (UTC): '+str(core.STATUS.get('telegram_last_error_at', '-')))
+        lines.append('Alert outbox last error: '+(OUTBOX.last_error or 'none'))
         lines.append('Durable alert queue: '+str(OUTBOX.totals()))
         lines.append('⚠️ Data API and broker fills are not guaranteed identical.')
         return core.tg_send('\n'.join(lines))
@@ -271,44 +302,74 @@ def command(textmsg, chat_id):
 
 
 def telegram_poll():
-    """Persist a high-water mark BEFORE acting to avoid replaying /pnl on restart.
-    Crash between marking and acting can skip a command; user can check /status.
+    """Crash-resilient Telegram command polling with bounded, jittered retry.
+
+    This loop handles *incoming commands* only. Outgoing trade alerts are sent
+    by the independent persistent outbox and are unaffected by this backoff.
+    An upstream reset/502 may still happen; failures remain visible in /diag.
     """
     with core.LOCK:
-        offset = STATE['last_processed_update_id']+1 if STATE['last_processed_update_id']>=0 else None
-    consecutive_errors=0
+        offset = STATE['last_processed_update_id']+1 if STATE['last_processed_update_id'] >= 0 else None
+    consecutive_errors = 0
+    core.STATUS.update(telegram_consecutive_errors=0,
+                       telegram_error_total=0, telegram_last_error_at='-')
     while True:
         try:
-            params={'timeout':22,'limit':30}
-            if offset is not None:params['offset']=offset
-            result=core.telegram_call('getUpdates',params,timeout=29)
-            if not result.get('ok'): raise RuntimeError('Telegram polling refused: '+str(result.get('description', ''))[:100])
-            consecutive_errors=0
-            core.STATUS['telegram_poll']='Cloud polling connected'
-            core.STATUS['telegram_last_ok']=dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
-            core.STATUS['telegram_error']=''
-            for upd in result.get('result',[]):
-                uid=upd.get('update_id')
-                if not isinstance(uid,int):continue
-                offset=uid+1
+            params = {'timeout': 22, 'limit': 30}
+            if offset is not None:
+                params['offset'] = offset
+            result = core.telegram_call('getUpdates', params, timeout=29)
+            if not result.get('ok'):
+                raise RuntimeError('Telegram getUpdates returned a failed response')
+            if consecutive_errors:
+                print(f'Telegram polling recovered after {consecutive_errors} interrupted request(s)', flush=True)
+            consecutive_errors = 0
+            core.STATUS['telegram_consecutive_errors'] = 0
+            core.STATUS['telegram_poll'] = 'Cloud polling connected'
+            core.STATUS['telegram_last_ok'] = dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+            core.STATUS['telegram_error'] = ''
+            for upd in result.get('result', []):
+                uid = upd.get('update_id')
+                if not isinstance(uid, int):
+                    continue
+                offset = uid + 1
                 with core.LOCK:
                     if uid <= STATE['last_processed_update_id']:
                         continue
-                    STATE['last_processed_update_id']=uid
-                    state_save()  # acknowledge locally before effect, prevents replay
-                msg=upd.get('message') or upd.get('edited_message') or {}
-                chat=msg.get('chat') or {}
-                if isinstance(msg.get('text'),str) and isinstance(chat.get('id'),int):
-                    try:command(msg['text'], chat['id'])
+                    STATE['last_processed_update_id'] = uid
+                    state_save()  # mark first to prevent a duplicate /pnl after restart
+                msg = upd.get('message') or upd.get('edited_message') or {}
+                chat = msg.get('chat') or {}
+                if isinstance(msg.get('text'), str) and isinstance(chat.get('id'), int):
+                    try:
+                        command(msg['text'], chat['id'])
                     except Exception as exc:
-                        print('Command processing failed:',type(exc).__name__,flush=True)
+                        print('Command processing failed:', type(exc).__name__, flush=True)
         except Exception as exc:
-            consecutive_errors+=1
-            core.STATUS['telegram_error']=str(exc)[:130]
+            consecutive_errors += 1
             code = f'HTTP {exc.code}' if isinstance(exc, urllib.error.HTTPError) else type(exc).__name__
-            print('Telegram polling issue:', code,flush=True)
-            # Back off on Telegram 429/502 and disconnects; retry automatically.
-            time.sleep(min(90, 5*consecutive_errors))
+            core.STATUS['telegram_error'] = code  # never log token-bearing URLs
+            core.STATUS['telegram_error_total'] += 1
+            core.STATUS['telegram_consecutive_errors'] = consecutive_errors
+            core.STATUS['telegram_poll'] = 'Reconnecting'
+            core.STATUS['telegram_last_error_at'] = dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+            # Telegram API rate-limit response can request a specific delay.
+            retry_after = 0
+            if isinstance(exc, urllib.error.HTTPError) and exc.code == 429:
+                try:
+                    retry_after = float((json.loads(exc.read().decode('utf-8'))
+                                         .get('parameters') or {}).get('retry_after', 0))
+                except (ValueError, OSError, TypeError, AttributeError):
+                    retry_after = 0
+            # Jitter prevents simultaneous reconnect storms after an outage.
+            delay = min(90, 3*(2 ** min(consecutive_errors-1, 5)))
+            delay = max(retry_after, delay * random.uniform(0.80, 1.20))
+            # One diagnostic per burst and periodic status updates, not every
+            # harmless long-poll interruption. /diag keeps full running counts.
+            if consecutive_errors == 1 or consecutive_errors % 5 == 0:
+                print(f'Telegram polling interruption: {code}; retry scheduled; '
+                      f'consecutive={consecutive_errors}', flush=True)
+            time.sleep(delay)
 
 
 def scanner():
@@ -351,7 +412,7 @@ def scanner():
 
 def main():
     bootstrap()
-    print('SNIPERFX CLOUD v2.1: ready; no public dashboard, secrets never printed.',flush=True)
+    print('SNIPERFX CLOUD v2.1.1: ready; no public dashboard, secrets never printed.',flush=True)
     print('Cloud persistent disk: detected. Telegram requires /start <new PIN> on first install.',flush=True)
     threading.Thread(target=telegram_poll,daemon=True).start()
     threading.Thread(target=scanner,daemon=True).start()
